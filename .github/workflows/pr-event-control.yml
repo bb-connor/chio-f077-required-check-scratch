@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       checks: write
+      contents: read
       pull-requests: read
     steps:
       - name: Post the mirror context on the current test merge commit
