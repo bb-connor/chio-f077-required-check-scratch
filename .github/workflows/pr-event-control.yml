@@ -33,6 +33,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          printf 'event=%s repo=%s pr=%s\n' "${GITHUB_EVENT_NAME}" "${GITHUB_REPOSITORY}" "${PR_NUMBER}"
           test "${GITHUB_EVENT_NAME}" = pull_request
           test "${GITHUB_REPOSITORY}" = bb-connor/chio-f077-required-check-scratch
           [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]
@@ -42,6 +43,7 @@ jobs:
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
           merge_sha="$(jq -r '.merge_commit_sha' <<< "${pull}")"
+          printf 'merge_sha=%s event_sha=%s\n' "${merge_sha}" "${EVENT_SHA}"
           [[ "${merge_sha}" =~ ^[0-9a-f]{40}$ ]]
           printf 'event_sha=%s merge_commit_sha=%s\n' "${EVENT_SHA}" "${merge_sha}" | tee -a "${GITHUB_STEP_SUMMARY}"
           details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
