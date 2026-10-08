@@ -1,0 +1,199 @@
+name: Post scratch check
+run-name: Post ${{ inputs.publisher }} ${{ inputs.kind }} ${{ inputs.conclusion }} on ${{ inputs.target_sha }} (${{ inputs.step_label }})
+
+# Models the production finalizer's publication path: a workflow_dispatch run
+# that creates check runs through the REST API on an exact commit. The
+# `actions` publisher uses the job token (GitHub Actions, App 15368) with the
+# same API call the finalizer uses for the four mirrors; the `app` publisher mints a narrowed
+# installation token for the scratch App as the finalizer does for the
+# dedicated-App `Security contract` check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      step_label:
+        description: Experiment step label recorded in the run name
+        required: true
+        type: string
+      publisher:
+        description: actions (job token, App 15368) or app (scratch App installation token)
+        required: true
+        type: choice
+        options:
+          - actions
+          - app
+      kind:
+        description: check (check run) or status (commit status)
+        required: true
+        type: choice
+        default: check
+        options:
+          - check
+          - status
+      name:
+        description: Exact check run name or commit status context
+        required: true
+        type: string
+      target_sha:
+        description: Exact 40-hex commit to annotate
+        required: true
+        type: string
+      conclusion:
+        description: Completed conclusion (check) or state (status)
+        required: true
+        type: choice
+        options:
+          - success
+          - failure
+      patch_check_run_id:
+        description: Existing check run ID to PATCH to the conclusion instead of creating one (check kind only)
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: post-scratch-check-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: write
+      statuses: write
+    steps:
+      - name: Validate inputs
+        env:
+          CONCLUSION: ${{ inputs.conclusion }}
+          KIND: ${{ inputs.kind }}
+          NAME: ${{ inputs.name }}
+          PATCH_ID: ${{ inputs.patch_check_run_id }}
+          PUBLISHER: ${{ inputs.publisher }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${PUBLISHER}" == actions || "${PUBLISHER}" == app ]]
+          [[ "${KIND}" == check || "${KIND}" == status ]]
+          [[ "${CONCLUSION}" == success || "${CONCLUSION}" == failure ]]
+          test -n "${NAME}"
+          [[ "${NAME}" != *$'\n'* ]]
+          if test -n "${PATCH_ID}"; then
+            [[ "${PATCH_ID}" =~ ^[1-9][0-9]*$ ]]
+            test "${KIND}" = check
+          fi
+          test "${GITHUB_EVENT_NAME}" = workflow_dispatch
+          test "${GITHUB_REPOSITORY}" = bb-connor/chio-f077-required-check-scratch
+
+      - name: Mint scratch App installation token
+        if: inputs.publisher == 'app'
+        env:
+          SCRATCH_APP_ID: ${{ vars.SCRATCH_APP_ID }}
+          SCRATCH_APP_INSTALLATION_ID: ${{ vars.SCRATCH_APP_INSTALLATION_ID }}
+          SCRATCH_APP_PRIVATE_KEY_PEM: ${{ secrets.SCRATCH_APP_PRIVATE_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          [[ "${SCRATCH_APP_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${SCRATCH_APP_INSTALLATION_ID}" =~ ^[1-9][0-9]*$ ]]
+          test "${SCRATCH_APP_ID}" != 15368
+          test "${SCRATCH_APP_ID}" != 4398745
+          test -n "${SCRATCH_APP_PRIVATE_KEY_PEM}"
+          umask 077
+          key_file="$(mktemp "${RUNNER_TEMP}/scratch-app-key.XXXXXX")"
+          trap 'rm -f -- "${key_file}"' EXIT
+          printf '%s\n' "${SCRATCH_APP_PRIVATE_KEY_PEM}" > "${key_file}"
+          openssl pkey -in "${key_file}" -check -noout > /dev/null
+          base64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now="$(date +%s)"
+          header="$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | base64url)"
+          claims="$(jq -cS -n --arg iss "${SCRATCH_APP_ID}" --argjson iat "$((now - 60))" --argjson exp "$((now + 540))" '{exp: $exp, iat: $iat, iss: $iss}' | base64url)"
+          signature="$(printf '%s' "${header}.${claims}" | openssl dgst -sha256 -sign "${key_file}" -binary | base64url)"
+          jwt="${header}.${claims}.${signature}"
+          echo "::add-mask::${jwt}"
+          installation="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${jwt}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "https://api.github.com/app/installations/${SCRATCH_APP_INSTALLATION_ID}")"
+          test "$(jq -r '.app_id' <<< "${installation}")" = "${SCRATCH_APP_ID}"
+          request="$(jq -cS -n --arg repo "${GITHUB_REPOSITORY#*/}" '{permissions: {checks: "write", statuses: "write"}, repositories: [$repo]}')"
+          response="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --request POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${jwt}" \
+            -H 'Content-Type: application/json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --data-binary "${request}" \
+            "https://api.github.com/app/installations/${SCRATCH_APP_INSTALLATION_ID}/access_tokens")"
+          token="$(jq -r '.token' <<< "${response}")"
+          test -n "${token}" && test "${token}" != null
+          echo "::add-mask::${token}"
+          token_file="${RUNNER_TEMP}/scratch-app-token"
+          printf '%s' "${token}" > "${token_file}"
+
+      - name: Post check run or status
+        env:
+          ACTIONS_TOKEN: ${{ github.token }}
+          CONCLUSION: ${{ inputs.conclusion }}
+          KIND: ${{ inputs.kind }}
+          NAME: ${{ inputs.name }}
+          PATCH_ID: ${{ inputs.patch_check_run_id }}
+          PUBLISHER: ${{ inputs.publisher }}
+          SCRATCH_APP_ID: ${{ vars.SCRATCH_APP_ID }}
+          STEP_LABEL: ${{ inputs.step_label }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          if test "${PUBLISHER}" = app; then
+            token="$(cat "${RUNNER_TEMP}/scratch-app-token")"
+            rm -f -- "${RUNNER_TEMP}/scratch-app-token"
+            expected_app_id="${SCRATCH_APP_ID}"
+          else
+            token="${ACTIONS_TOKEN}"
+            expected_app_id=15368
+          fi
+          api() {
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Content-Type: application/json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "$@"
+          }
+          external_id="f077:${STEP_LABEL}:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          if test "${KIND}" = status; then
+            payload="$(jq -cS -n --arg context "${NAME}" --arg state "${CONCLUSION}" --arg url "${details_url}" \
+              '{context: $context, description: "F077 scratch status", state: $state, target_url: $url}')"
+            result="$(api --request POST --data-binary "${payload}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}")"
+            test "$(jq -r '.context' <<< "${result}")" = "${NAME}"
+            test "$(jq -r '.state' <<< "${result}")" = "${CONCLUSION}"
+            jq -cS '{kind: "status", id, context, state, creator: .creator.login, created_at}' <<< "${result}" | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          if test -n "${PATCH_ID}"; then
+            payload="$(jq -cS -n --arg conclusion "${CONCLUSION}" \
+              '{conclusion: $conclusion, status: "completed"}')"
+            result="$(api --request PATCH --data-binary "${payload}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs/${PATCH_ID}")"
+            test "$(jq -r '.id' <<< "${result}")" = "${PATCH_ID}"
+          else
+            payload="$(jq -cS -n \
+              --arg conclusion "${CONCLUSION}" \
+              --arg details_url "${details_url}" \
+              --arg external_id "${external_id}" \
+              --arg head_sha "${TARGET_SHA}" \
+              --arg name "${NAME}" \
+              '{conclusion: $conclusion, details_url: $details_url, external_id: $external_id, head_sha: $head_sha, name: $name, output: {summary: "F077 scratch check", title: "F077 scratch check"}, status: "completed"}')"
+            result="$(api --request POST --data-binary "${payload}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs")"
+          fi
+          test "$(jq -r '.name' <<< "${result}")" = "${NAME}"
+          test "$(jq -r '.head_sha' <<< "${result}")" = "${TARGET_SHA}"
+          test "$(jq -r '.status' <<< "${result}")" = completed
+          test "$(jq -r '.conclusion' <<< "${result}")" = "${CONCLUSION}"
+          test "$(jq -r '.app.id' <<< "${result}")" = "${expected_app_id}"
+          jq -cS '{kind: "check", id, name, head_sha, conclusion, external_id, app_id: .app.id, app_slug: .app.slug, check_suite_id: .check_suite.id}' <<< "${result}" | tee -a "${GITHUB_STEP_SUMMARY}"

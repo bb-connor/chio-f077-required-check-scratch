@@ -1,0 +1,63 @@
+name: Pull request event control
+
+# Control for the event restriction: the same API-created job-token check run
+# as post-check.yml, but posted from a run whose triggering event is
+# pull_request (an eligible event) instead of workflow_dispatch. It fires only
+# when the operator adds the exact label below.
+
+on:
+  pull_request:
+    types:
+      - labeled
+
+permissions: {}
+
+concurrency:
+  group: pr-event-control-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  post-from-pull-request-event:
+    if: github.event.label.name == 'f077-post-mirror-from-pr-event'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Post the mirror context on the current test merge commit
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          NAME: Security mirror / Build, lint, test
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_EVENT_NAME}" = pull_request
+          test "${GITHUB_REPOSITORY}" = bb-connor/chio-f077-required-check-scratch
+          [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]
+          pull="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          merge_sha="$(jq -r '.merge_commit_sha' <<< "${pull}")"
+          [[ "${merge_sha}" =~ ^[0-9a-f]{40}$ ]]
+          printf 'event_sha=%s merge_commit_sha=%s\n' "${EVENT_SHA}" "${merge_sha}" | tee -a "${GITHUB_STEP_SUMMARY}"
+          details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          payload="$(jq -cS -n \
+            --arg details_url "${details_url}" \
+            --arg external_id "f077:pr-event-control:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}" \
+            --arg head_sha "${merge_sha}" \
+            --arg name "${NAME}" \
+            '{conclusion: "success", details_url: $details_url, external_id: $external_id, head_sha: $head_sha, name: $name, output: {summary: "F077 pull_request event control", title: "F077 pull_request event control"}, status: "completed"}')"
+          result="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --request POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --data-binary "${payload}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs")"
+          test "$(jq -r '.app.id' <<< "${result}")" = 15368
+          test "$(jq -r '.head_sha' <<< "${result}")" = "${merge_sha}"
+          jq -cS '{kind: "check", id, name, head_sha, conclusion, external_id, app_id: .app.id, check_suite_id: .check_suite.id}' <<< "${result}" | tee -a "${GITHUB_STEP_SUMMARY}"

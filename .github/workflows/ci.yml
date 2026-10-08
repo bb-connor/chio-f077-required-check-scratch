@@ -1,0 +1,34 @@
+name: CI
+
+# Models the production ordinary CI context that ruleset 22033486 requires:
+# a job check run named "Build, lint, test" reported on the pull request head
+# by a pull_request-triggered run, and on main by push.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, lint, test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the ordinary context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: printf 'event=%s sha=%s head=%s\n' "${EVENT_NAME}" "${GITHUB_SHA}" "${HEAD_SHA}"
